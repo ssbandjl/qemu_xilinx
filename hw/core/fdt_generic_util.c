@@ -45,6 +45,8 @@
 #include "block/block.h"
 #include "hw/ssi/ssi.h"
 #include "hw/block/m24cxx.h"
+#include "hw/nvram/xlnx-bbram.h"
+#include "hw/nvram/xlnx-efuse.h"
 #include "hw/boards.h"
 #include "qemu/option.h"
 #include "hw/qdev-properties.h"
@@ -279,6 +281,7 @@ static void fdt_init_node(void *args)
             }
 
             if (!fdt_init_qdev(node_path, fdti, compat)) {
+                check_compat("postinit:", compat, node_path, fdti);
                 goto exit;
             }
 
@@ -935,6 +938,30 @@ static void fdt_attach_drive(FDTMachineInfo *fdti, char *node_path,
     return;
 }
 
+static void fdt_attach_indexed_drive(FDTMachineInfo *fdti, char *node_path,
+                                     Object *dev, uint32_t di_default,
+                                     BlockInterfaceType drive_type)
+{
+    static const char prop[] = "drive-index";
+    uint32_t *di_val = NULL;
+    int di_len = 0;
+
+    di_val = qemu_fdt_getprop(fdti->fdt, node_path, prop, &di_len, false, NULL);
+    if (!di_val || (di_len != sizeof(*di_val))) {
+        uint32_t di = cpu_to_be32(di_default);
+        int r;
+
+        r = qemu_fdt_setprop(fdti->fdt, node_path, prop, &di, sizeof(di));
+        if (r < 0) {
+            error_setg(&error_abort,
+                       "Couldn't set fdt property %s.%s: %s",
+                       node_path, prop, fdt_strerror(r));
+        }
+    }
+
+    fdt_attach_drive(fdti, node_path, dev, drive_type);
+}
+
 static Object *fdt_create_from_compat(const char *compat, char **dev_type)
 {
     Object *ret = NULL;
@@ -1466,6 +1493,26 @@ static int fdt_init_qdev(char *node_path, FDTMachineInfo *fdti, char *compat)
                  *  Remove these after we fully convert to blockdev based
                  *  drive binding.
                  */
+                if (object_dynamic_cast(dev, TYPE_XLNX_BBRAM)) {
+                    /* default drive index: 0 for Versal, 2 for ZU+ */
+                    uint32_t di;
+
+                    di = object_property_get_uint(dev, "crc-zpads",
+                                                  &error_abort) == 0
+                         ? 0 : 2;
+                    fdt_attach_indexed_drive(fdti, node_path, dev,
+                                             di, IF_PFLASH);
+                }
+                if (object_dynamic_cast(dev, TYPE_XLNX_EFUSE)) {
+                    /* default drive index: 1 for Versal, 3 for ZU+ */
+                    uint32_t di;
+
+                    di = object_property_get_uint(dev, "efuse-size",
+                                                  &error_abort) > 2048
+                         ? 1 : 3;
+                    fdt_attach_indexed_drive(fdti, node_path, dev,
+                                             di, IF_PFLASH);
+                }
                 if (object_dynamic_cast(dev, TYPE_SSI_PERIPHERAL)) {
                     fdt_attach_drive(fdti, node_path, dev, IF_MTD);
                 }
@@ -1693,9 +1740,10 @@ exit_reg_parse:
 
             if (c) {
                 uint16_t range = c->range ? c->range : 1;
-                while ((c->fdt_index > i || c->fdt_index + range <= i)
+                while (((c->fdt_index > i) || ((c->fdt_index + range) <= i))
                        && c->name) {
                     c++;
+                    range = c->range ? c->range : 1;
                 }
                 named_idx = i - c->fdt_index;
                 gpio_name = c->name;

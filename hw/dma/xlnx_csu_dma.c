@@ -38,9 +38,14 @@
  */
 REG32(ADDR, 0x0)
     FIELD(ADDR, ADDR, 2, 30) /* wo */
+REG32(ADDR_UNALIGNED, 0x0) /* when the DMA allows unaligned accesses */
+    FIELD(ADDR_UNALIGNED, ADDR, 0, 32) /* wo */
 REG32(SIZE, 0x4)
     FIELD(SIZE, SIZE, 2, 27) /* wo */
     FIELD(SIZE, LAST_WORD, 0, 1) /* rw, only exists in SRC */
+REG32(SIZE_UNALIGNED, 0x4) /* when the DMA allows unaligned accesses */
+    FIELD(SIZE_UNALIGNED, SIZE, 0, 29) /* wo */
+    FIELD(SIZE_UNALIGNED, LAST_WORD, 29, 1) /* rw, only exists in SRC */
 REG32(STATUS, 0x8)
     FIELD(STATUS, DONE_CNT, 13, 3) /* wtc */
     FIELD(STATUS, FIFO_LEVEL, 5, 8) /* ro */
@@ -100,6 +105,9 @@ REG32(CTRL2, 0x24)
     FIELD(CTRL2, MAX_OUTS_CMDS, 0, 4) /* rw, reset: 0x8 */
 REG32(ADDR_MSB, 0x28)
     FIELD(ADDR_MSB, ADDR_MSB, 0, 17) /* wo */
+REG32(CRC1, 0x2c) /* on 128 bits DMAs */
+REG32(CRC2, 0x30)
+REG32(CRC3, 0x34)
 
 #define R_CTRL_TIMEOUT_VAL_RESET    (0xFFE)
 #define R_CTRL_FIFO_THRESH_RESET    (0x80)
@@ -148,39 +156,120 @@ static void xlnx_csu_dma_update_done_cnt(XlnxCSUDMA *s, int a)
     ARRAY_FIELD_DP32(s->regs, STATUS, DONE_CNT, cnt);
 }
 
-static void xlnx_csu_dma_data_process(XlnxCSUDMA *s, uint8_t *buf, uint32_t len)
+static inline void update_crc_32(XlnxCSUDMA *s, const uint8_t *buf, uint32_t len)
 {
-    uint32_t bswap;
-    uint32_t i;
+    uint32_t leftover = 0;
+    size_t shift = 0;
 
-    bswap = s->regs[R_CTRL] & R_CTRL_ENDIANNESS_MASK;
-    if (s->is_dst && !bswap) {
-        /* Fast when ENDIANNESS cleared */
+    while (len >= 4) {
+        s->regs[R_CRC] += ldl_he_p(buf);
+        buf += 4;
+        len -= 4;
+    }
+
+    /*
+     * Handle unaligned accesses. The DMA pads missing MSB bytes with 0s for CRC
+     * computation. Once we're here we have at most 3 bytes to read.
+     */
+    while (len) {
+        size_t ld_sz = pow2floor(MIN(2, len));
+
+        leftover |= ldn_he_p(buf, ld_sz) << shift;
+
+        shift += ld_sz;
+        buf += ld_sz;
+        len -= ld_sz;
+    }
+
+    s->regs[R_CRC] += leftover;
+}
+
+static inline void update_crc_128(XlnxCSUDMA *s, const uint8_t *buf,
+                                  uint32_t len)
+{
+    Int128 crc;
+    Int128 leftover = int128_zero();
+    uint64_t lo, hi;
+    size_t shift = 0;
+
+    crc = int128_make128(s->regs[R_CRC1], s->regs[R_CRC3]);
+    crc = int128_lshift(crc, 32);
+    crc = int128_or(crc, int128_make128(s->regs[R_CRC], s->regs[R_CRC2]));
+
+    while (len >= 16) {
+        Int128 d;
+
+        d = int128_make128(ldq_he_p(buf), ldq_he_p(buf + 8));
+
+        int128_addto(&crc, d);
+        buf += 16;
+        len -= 16;
+    }
+
+    while (len) {
+        Int128 d;
+        size_t ld_sz = pow2floor(MIN(8, len));
+
+        d = int128_make64(ldn_he_p(buf, ld_sz));
+        d = int128_lshift(d, shift);
+        leftover = int128_or(leftover, d);
+
+        shift += ld_sz;
+        buf += ld_sz;
+        len -= ld_sz;
+    }
+
+    int128_addto(&crc, leftover);
+
+    lo = int128_getlo(crc);
+    hi = int128_gethi(crc);
+    s->regs[R_CRC] = lo & UINT32_MAX;
+    s->regs[R_CRC1] = lo >> 32;
+    s->regs[R_CRC2] = hi & UINT32_MAX;
+    s->regs[R_CRC3] = hi >> 32;
+}
+
+static void update_crc(XlnxCSUDMA *s, const uint8_t *buf, uint32_t len)
+{
+    g_assert(!s->is_dst);
+
+    switch (s->width) {
+    case 4:
+        update_crc_32(s, buf, len);
+        break;
+
+    case 16:
+        update_crc_128(s, buf, len);
+        break;
+
+    default:
+        g_assert_not_reached();
+    }
+}
+
+static inline void do_byte_swap(XlnxCSUDMA *s, uint8_t *buf, uint32_t len)
+{
+    uint32_t *b;
+
+    if (!FIELD_EX32(s->regs[R_CTRL], CTRL, ENDIANNESS)) {
+        /* byte swapping disabled */
         return;
     }
 
-    for (i = 0; i < len; i += 4) {
-        uint8_t *b = &buf[i];
-        union {
-            uint8_t u8[4];
-            uint32_t u32;
-        } v = {
-            .u8 = { b[0], b[1], b[2], b[3] }
-        };
+    if (len & 0x3) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "xlnx-csu-dma: endianness swapping on "
+                      "non 32 bits aligned data is undefined behavior\n");
+        /* we choose to skip the swapping */
+        return;
+    }
 
-        if (!s->is_dst) {
-            s->regs[R_CRC] += v.u32;
-        }
-        if (bswap) {
-            /*
-             * No point using bswap, we need to writeback
-             * into a potentially unaligned pointer.
-             */
-            b[0] = v.u8[3];
-            b[1] = v.u8[2];
-            b[2] = v.u8[1];
-            b[3] = v.u8[0];
-        }
+    b = (uint32_t *) buf;
+
+    while (len) {
+        bswap32s(b);
+        b++;
+        len -= 4;
     }
 }
 
@@ -201,17 +290,18 @@ static uint32_t xlnx_csu_dma_read(XlnxCSUDMA *s, uint8_t *buf, uint32_t len)
         for (i = 0; i < len && (result == MEMTX_OK); i += s->width) {
             uint32_t mlen = MIN(len - i, s->width);
 
-            result = address_space_rw(&s->dma_as, addr, s->attr,
+            result = address_space_rw(&s->dma_as, addr, *s->attr_r,
                                       buf + i, mlen, false);
         }
     } else {
-        result = address_space_rw(&s->dma_as, addr, s->attr, buf, len, false);
+        result = address_space_rw(&s->dma_as, addr, *s->attr_r, buf, len, false);
     }
 
     if (result == MEMTX_OK) {
-        xlnx_csu_dma_data_process(s, buf, len);
+        update_crc(s, buf, len);
+        do_byte_swap(s, buf, len);
     } else {
-        qemu_log_mask(LOG_GUEST_ERROR, "%s: Bad address " TARGET_FMT_plx
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: Bad address " HWADDR_FMT_plx
                       " for mem read", __func__, addr);
         s->regs[R_INT_STATUS] |= R_INT_STATUS_AXI_BRESP_ERR_MASK;
         xlnx_csu_dma_update_irq(s);
@@ -225,23 +315,24 @@ static uint32_t xlnx_csu_dma_write(XlnxCSUDMA *s, uint8_t *buf, uint32_t len)
     hwaddr addr = (hwaddr)s->regs[R_ADDR_MSB] << 32 | s->regs[R_ADDR];
     MemTxResult result = MEMTX_OK;
 
-    xlnx_csu_dma_data_process(s, buf, len);
+    do_byte_swap(s, buf, len);
+
     if (xlnx_csu_dma_burst_is_fixed(s)) {
         uint32_t i;
 
         for (i = 0; i < len && (result == MEMTX_OK); i += s->width) {
             uint32_t mlen = MIN(len - i, s->width);
 
-            result = address_space_rw(&s->dma_as, addr, s->attr,
+            result = address_space_rw(&s->dma_as, addr, *s->attr_w,
                                       buf, mlen, true);
             buf += mlen;
         }
     } else {
-        result = address_space_rw(&s->dma_as, addr, s->attr, buf, len, true);
+        result = address_space_rw(&s->dma_as, addr, *s->attr_w, buf, len, true);
     }
 
     if (result != MEMTX_OK) {
-        qemu_log_mask(LOG_GUEST_ERROR, "%s: Bad address " TARGET_FMT_plx
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: Bad address " HWADDR_FMT_plx
                       " for mem write", __func__, addr);
         s->regs[R_INT_STATUS] |= R_INT_STATUS_AXI_BRESP_ERR_MASK;
         xlnx_csu_dma_update_irq(s);
@@ -328,8 +419,14 @@ static void xlnx_csu_dma_src_notify(void *opaque)
 
 static uint64_t addr_pre_write(RegisterInfo *reg, uint64_t val)
 {
-    /* Address is word aligned */
-    return val & R_ADDR_ADDR_MASK;
+    XlnxCSUDMA *s = XLNX_CSU_DMA(reg->opaque);
+
+    if (s->allow_unaligned) {
+        return val & R_ADDR_UNALIGNED_ADDR_MASK;
+    } else {
+        /* Address is word aligned */
+        return val & R_ADDR_ADDR_MASK;
+    }
 }
 
 static uint64_t size_pre_write(RegisterInfo *reg, uint64_t val)
@@ -342,18 +439,24 @@ static uint64_t size_pre_write(RegisterInfo *reg, uint64_t val)
     }
 
     if (!s->is_dst) {
-        s->r_size_last_word = !!(val & R_SIZE_LAST_WORD_MASK);
+        uint32_t mask = s->allow_unaligned ? R_SIZE_UNALIGNED_LAST_WORD_MASK
+                                           : R_SIZE_LAST_WORD_MASK;
+        s->r_size_last_word = !!(val & mask);
     }
 
     /* Size is word aligned */
-    return val & R_SIZE_SIZE_MASK;
+    return val & (s->allow_unaligned ? R_SIZE_UNALIGNED_SIZE_MASK
+                                     : R_SIZE_SIZE_MASK);
 }
 
 static uint64_t size_post_read(RegisterInfo *reg, uint64_t val)
 {
     XlnxCSUDMA *s = XLNX_CSU_DMA(reg->opaque);
+    int shift = s->allow_unaligned ? R_SIZE_UNALIGNED_LAST_WORD_SHIFT
+                                   : R_SIZE_LAST_WORD_SHIFT;
+    uint32_t last_word = s->r_size_last_word;
 
-    return val | s->r_size_last_word;
+    return val | (last_word << shift);
 }
 
 static void size_post_write(RegisterInfo *reg, uint64_t val)
@@ -549,6 +652,15 @@ static const RegisterAccessInfo *xlnx_csu_dma_regs_info[] = {
             .name = #NAME "_ADDR_MSB",                                        \
             .addr = A_ADDR_MSB,                                               \
             .pre_write = addr_msb_pre_write                                   \
+        }, {                                                                  \
+            .name = #NAME "_CRC1",                                            \
+            .addr = A_CRC1,                                                   \
+        }, {                                                                  \
+            .name = #NAME "_CRC2",                                            \
+            .addr = A_CRC2,                                                   \
+        }, {                                                                  \
+            .name = #NAME "_CRC3",                                            \
+            .addr = A_CRC3,                                                   \
         }                                                                     \
     }
 
@@ -584,10 +696,14 @@ static size_t xlnx_csu_dma_stream_push(StreamSink *obj, uint8_t *buf,
 {
     XlnxCSUDMA *s = XLNX_CSU_DMA(obj);
     uint32_t size = s->regs[R_SIZE];
-    uint32_t mlen = MIN(size, len) & (~3); /* Size is word aligned */
+    uint32_t mlen = MIN(size, len);
 
     /* Be called when it's DST */
     assert(s->is_dst);
+
+    if (!s->allow_unaligned) {
+        mlen &= R_SIZE_SIZE_MASK; /* size is word aligned */
+    }
 
     if (size == 0 || len <= 0) {
         return 0;
@@ -639,10 +755,37 @@ static void xlnx_csu_dma_realize(DeviceState *dev, Error **errp)
 {
     XlnxCSUDMA *s = XLNX_CSU_DMA(dev);
     RegisterInfoArray *reg_array;
+    StreamSink * const TX_DEVS[] = { s->tx_dev, s->tx_dev0, s->tx_dev1 };
+    static const char TX_DEVS_NAME[] = { ' ', '0', '1' };
+    QEMU_BUILD_BUG_ON(ARRAY_SIZE(TX_DEVS) != ARRAY_SIZE(TX_DEVS_NAME));
 
-    if (!s->is_dst && !s->tx_dev) {
-        error_setg(errp, "zynqmp.csu-dma: Stream not connected");
+    if (s->width != 4 && s->width != 16) {
+        error_setg(errp, TYPE_XLNX_CSU_DMA ": unsupported value for "
+                         "`width' property");
         return;
+    }
+
+    if (!s->is_dst) {
+        size_t i, target = 0;
+
+        for (i = 1; i < ARRAY_SIZE(TX_DEVS); i++) {
+            if (TX_DEVS[i] != NULL) {
+                if (TX_DEVS[target] != NULL) {
+                    error_setg(errp, "zynqmp.csu-dma: both tx_dev%c "
+                               "and tx_dev%c StreamSinks are defined",
+                               TX_DEVS_NAME[target], TX_DEVS_NAME[i]);
+                    return;
+                }
+                target = i;
+            }
+        }
+
+        s->tx_dev = TX_DEVS[target];
+
+        if (s->tx_dev == NULL) {
+            error_setg(errp, "zynqmp.csu-dma: Stream not connected");
+            return;
+        }
     }
 
     if (!s->dma_mr) {
@@ -668,7 +811,15 @@ static void xlnx_csu_dma_realize(DeviceState *dev, Error **errp)
     s->src_timer = ptimer_init(xlnx_csu_dma_src_timeout_hit,
                                s, PTIMER_POLICY_LEGACY);
 
-    s->attr = MEMTXATTRS_UNSPECIFIED;
+    if (!s->attr_r) {
+        Object *attr = object_new(TYPE_MEMORY_TRANSACTION_ATTR);
+        s->attr_r = MEMORY_TRANSACTION_ATTR(attr);
+        *s->attr_r = MEMTXATTRS_UNSPECIFIED;
+    }
+
+    if (!s->attr_w) {
+        s->attr_w = s->attr_r;
+    }
 
     s->r_size_last_word = 0;
 }
@@ -692,7 +843,8 @@ static Property xlnx_csu_dma_properties[] = {
      * Ref PG021, Stream Data Width:
      * Data width in bits of the AXI S2MM AXI4-Stream Data bus.
      * This value must be equal or less than the Memory Map Data Width.
-     * Valid values are 8, 16, 32, 64, 128, 512 and 1024.
+     * Valid values are 4 and 16. When set to 16, the DMA will expose 4 32 bits
+     * CRC registers instead of one.
      * "dma-width" is the byte value of the "Stream Data Width".
      */
     DEFINE_PROP_UINT16("dma-width", XlnxCSUDMA, width, 4),
@@ -701,7 +853,15 @@ static Property xlnx_csu_dma_properties[] = {
      * the SRC (read) channel and DST (write) channel. "is-dst" is used to mark
      * which channel the device is connected to.
      */
-    DEFINE_PROP_BOOL("is-dst", XlnxCSUDMA, is_dst, true),
+    DEFINE_PROP_BOOL("is-dst", XlnxCSUDMA, is_dst, false),
+    /*
+     * The DMA can either have a 4-bytes alignement constraint on the address
+     * and size registers, or allows unaligned accesses. When byte-align is
+     * false, the accesses are 4 bytes aligned. When true, unaligned accesses
+     * are allowed. In case of a source DMA (is-dst == false), this also means
+     * that the LAST_WORD bit in the size register moves to bit 29.
+     */
+    DEFINE_PROP_BOOL("byte-align", XlnxCSUDMA, allow_unaligned, false),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -733,8 +893,24 @@ static void xlnx_csu_dma_init(Object *obj)
                              (Object **)&s->tx_dev,
                              qdev_prop_allow_set_link_before_realize,
                              OBJ_PROP_LINK_STRONG);
+    object_property_add_link(obj, "stream-connected-dma0", TYPE_STREAM_SINK,
+                             (Object **)&s->tx_dev0,
+                             qdev_prop_allow_set_link_before_realize,
+                             OBJ_PROP_LINK_STRONG);
+    object_property_add_link(obj, "stream-connected-dma1", TYPE_STREAM_SINK,
+                             (Object **)&s->tx_dev1,
+                             qdev_prop_allow_set_link_before_realize,
+                             OBJ_PROP_LINK_STRONG);
     object_property_add_link(obj, "dma", TYPE_MEMORY_REGION,
                              (Object **)&s->dma_mr,
+                             qdev_prop_allow_set_link_before_realize,
+                             OBJ_PROP_LINK_STRONG);
+    object_property_add_link(obj, "memattr", TYPE_MEMORY_TRANSACTION_ATTR,
+                             (Object **)&s->attr_r,
+                             qdev_prop_allow_set_link_before_realize,
+                             OBJ_PROP_LINK_STRONG);
+    object_property_add_link(obj, "memattr-write", TYPE_MEMORY_TRANSACTION_ATTR,
+                             (Object **)&s->attr_w,
                              qdev_prop_allow_set_link_before_realize,
                              OBJ_PROP_LINK_STRONG);
 }
@@ -752,9 +928,15 @@ static const TypeInfo xlnx_csu_dma_info = {
     }
 };
 
+static const TypeInfo xlnx_csu_dma_alias_info = {
+    .name   = TYPE_XLNX_CSU_DMA_ALIAS,
+    .parent = TYPE_XLNX_CSU_DMA,
+};
+
 static void xlnx_csu_dma_register_types(void)
 {
     type_register_static(&xlnx_csu_dma_info);
+    type_register_static(&xlnx_csu_dma_alias_info);
 }
 
 type_init(xlnx_csu_dma_register_types)

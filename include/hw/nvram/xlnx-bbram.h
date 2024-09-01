@@ -31,10 +31,11 @@
 #include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "hw/register.h"
+#include "hw/zynqmp_aes_key.h"
 
 #define RMAX_XLNX_BBRAM ((0x4c / 4) + 1)
 
-#define TYPE_XLNX_BBRAM "xlnx-bbram-ctrl"
+#define TYPE_XLNX_BBRAM "xlnx.bbram-ctrl"
 OBJECT_DECLARE_SIMPLE_TYPE(XlnxBBRam, XLNX_BBRAM);
 
 struct XlnxBBRam {
@@ -42,10 +43,12 @@ struct XlnxBBRam {
     qemu_irq irq_bbram;
 
     BlockBackend *blk;
+    ZynqMPAESKeySink *aes;
 
     uint32_t crc_zpads;
     bool bbram8_wo;
     bool blk_ro;
+    bool ext_erase;
 
     uint32_t regs[RMAX_XLNX_BBRAM];
     RegisterInfo regs_info[RMAX_XLNX_BBRAM];

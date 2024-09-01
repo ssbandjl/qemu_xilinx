@@ -29,7 +29,7 @@ void xhci_sysbus_reset(DeviceState *dev)
 {
     XHCISysbusState *s = XHCI_SYSBUS(dev);
 
-    device_legacy_reset(DEVICE(&s->xhci));
+    device_cold_reset(DEVICE(&s->xhci));
 }
 
 static void xhci_sysbus_realize(DeviceState *dev, Error **errp)
@@ -48,6 +48,11 @@ static void xhci_sysbus_realize(DeviceState *dev, Error **errp)
         address_space_init(s->xhci.as, s->xhci.dma_mr, NULL);
     } else {
         s->xhci.as = &address_space_memory;
+    }
+
+    if (!s->xhci.attrs) {
+        s->xhci.attrs = g_new(MemTxAttrs, 1);
+        *s->xhci.attrs = MEMTXATTRS_UNSPECIFIED;
     }
 
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->xhci.mem);

@@ -30,13 +30,15 @@
 #include "sysemu/block-backend.h"
 #include "hw/qdev-core.h"
 
-#define TYPE_XLNX_EFUSE "xlnx-efuse"
+#define TYPE_XLNX_EFUSE "xlnx.efuse"
 OBJECT_DECLARE_SIMPLE_TYPE(XlnxEFuse, XLNX_EFUSE);
 
 typedef struct XlnxEFusePufData {
     uint32_t puf_dis:1;
-    uint16_t pufsyn_len;
-    uint8_t  pufsyn[0];
+    uint32_t puf_aux;
+    uint32_t puf_chash;
+    uint16_t pufsyn_len; /* 0: efuse marked SYN block as invalid */
+    uint32_t pufsyn[0];
 } XlnxEFusePufData;
 
 typedef struct XlnxEFuseSysmonData {
@@ -63,6 +65,7 @@ struct XlnxEFuse {
 
     uint32_t *ro_bits;
     uint32_t ro_bits_cnt;
+    int extidcode;
 };
 
 /**
@@ -125,6 +128,18 @@ bool xlnx_efuse_k256_check(XlnxEFuse *s, uint32_t crc, unsigned start);
 uint32_t xlnx_efuse_tbits_check(XlnxEFuse *s);
 
 /**
+ * xlnx_efuse_extidcode_check:
+ * @s: the efuse object
+ * @offset: start offset of extidcode
+ *
+ * This function programms exidcode read from "init-factory-extidcode"
+ * property if the field is not programmed already.
+ *
+ */
+void xlnx_efuse_extidcode_check(XlnxEFuse *s, uint32_t offset);
+
+
+/**
  * xlnx_efuse_get_row:
  * @s: the efuse object
  * @bit: the efuse bit address for which a 32-bit value is read
@@ -169,7 +184,7 @@ static inline uint32_t xlnx_efuse_get_u32(XlnxEFuse *s,
 /**
  * xlnx_efuse_get_puf:
  * @s: the efuse object
- * @pufsyn_max: the upper limit on amount of puf-syn data returned;
+ * @pufsyn_max: the upper limit on bytes of puf-syn data returned;
  *              if 0, all stored puf-syn data are returned.
  *
  * Return: pointer to a XlnxEFusePufData object, where .pufsyn_len
@@ -188,19 +203,31 @@ static inline XlnxEFusePufData *xlnx_efuse_get_puf(XlnxEFuse *s,
 
 /**
  * xlnx_efuse_get_sysmon:
- * @s: the efuse object
+ * @s: the efuse object.
  * @d: pointer to data receiver.
+ *
+ * If @s is NULL but @d is not, return true with data all 0s, to
+ * handle use cases where a linkage to an efuse object is optional.
  *
  * Returns: false if failed to retrieve the data.
  */
 static inline bool xlnx_efuse_get_sysmon(XlnxEFuse *s,
                                          XlnxEFuseSysmonData *d)
 {
-    if (s && s->fuse32 && s->dev && s->get_sysmon && d) {
-        return s->get_sysmon(s->dev, d);
-    } else {
-        return false;
+    bool rc = false;
+
+    if (!s && d) {
+        memset(d, 0, sizeof(*d));
+        return true;
     }
+
+    if (s->fuse32 && s->dev && s->get_sysmon && d) {
+        rc = s->get_sysmon(s->dev, d);
+    }
+    if (!rc && d) {
+        memset(d, 0, sizeof(*d));
+    }
+    return rc;
 }
 
 #endif

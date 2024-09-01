@@ -27,21 +27,26 @@
 #include "hw/stream.h"
 
 #define TYPE_XLNX_CSU_DMA "xlnx.csu_dma"
+#define TYPE_XLNX_CSU_DMA_ALIAS "zynqmp.csu-dma"
 
-#define XLNX_CSU_DMA_R_MAX (0x2c / 4)
+#define XLNX_CSU_DMA_R_MAX (0x38 / 4)
 
 typedef struct XlnxCSUDMA {
     SysBusDevice busdev;
     MemoryRegion iomem;
-    MemTxAttrs attr;
+    MemTxAttrs *attr_r;
+    MemTxAttrs *attr_w;
     MemoryRegion *dma_mr;
     AddressSpace dma_as;
     qemu_irq irq;
     StreamSink *tx_dev; /* Used as generic StreamSink */
+    StreamSink *tx_dev0; /* Used for pmc dma0 */
+    StreamSink *tx_dev1; /* Used for pmc dma1 */
     ptimer_state *src_timer;
 
     uint16_t width;
     bool is_dst;
+    bool allow_unaligned;
     bool r_size_last_word;
 
     StreamCanPushNotifyFn notify;

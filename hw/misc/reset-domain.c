@@ -1,7 +1,8 @@
 /*
  * Tiny device allowing reset of all devices mapped to a given MR.
  *
- * Copyright (c) 2018 Xilinx Inc
+ * Copyright (C) 2018-2022, Xilinx, Inc.
+ * Copyright (C) 2022-2024, Advanced Micro Devices, Inc.#include "qemu/osdep.h"
  * Written by Edgar E. Iglesias <edgar.iglesias@xilinx.com>
  *
  * This code is licensed under the GNU GPL.
@@ -44,11 +45,34 @@ typedef struct ResetDomain {
     MemoryRegion *mr[MAX_RESET_MR];
 } ResetDomain;
 
+static int qdev_reset_one(DeviceState *dev, void *opaque)
+{
+    DeviceClass *klass = DEVICE_GET_CLASS(dev);
+    if (klass->reset) {
+        klass->reset(dev);
+    }
+    return 0;
+}
+
+static int qbus_reset_one(BusState *bus, void *opaque)
+{
+    BusClass *bc = BUS_GET_CLASS(bus);
+    if (bc->reset) {
+        bc->reset(bus);
+    }
+    return 0;
+}
+
+static void qdev_reset_all(DeviceState *dev)
+{
+    qdev_walk_children(dev, NULL, NULL, qdev_reset_one, qbus_reset_one, NULL);
+}
+
 static void reset_mr(ResetDomain *s, MemoryRegion *mr, int level)
 {
     Object *obj_owner;
     DeviceState *dev_owner;
-    const MemoryRegion *submr;
+    MemoryRegion *submr;
 
     QTAILQ_FOREACH(submr, &mr->subregions, subregions_link) {
         if (submr->alias) {
@@ -60,15 +84,23 @@ static void reset_mr(ResetDomain *s, MemoryRegion *mr, int level)
             }
             continue;
         }
-        obj_owner = memory_region_owner((MemoryRegion *)submr);
+        obj_owner = memory_region_owner(submr);
+
+        if (!QTAILQ_EMPTY(&submr->subregions)) {
+            DPRINT("Recurse MR %s (%p)\n",
+                   memory_region_name(submr), submr);
+            reset_mr(s, submr, level + 1);
+        }
+
         if (!object_dynamic_cast(obj_owner, TYPE_DEVICE)) {
             /* Cannot reset non-device objects.  */
             continue;
         }
 
         dev_owner = DEVICE(obj_owner);
-        DPRINT("MR %s RESET owner %s\n",
-               memory_region_name(submr), dev_owner->id);
+        DPRINT("MR %s (%p) RESET owner %s\n",
+               memory_region_name(submr), submr,
+               dev_owner->id);
         qdev_reset_all(dev_owner);
     }
 }

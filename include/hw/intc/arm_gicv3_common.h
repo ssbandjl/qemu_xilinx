@@ -73,6 +73,12 @@
 #define GIC_BIT_MASK(nr) (1U << ((nr) % 32))
 #define GIC_BIT_WORD(nr) ((nr) / 32)
 
+/*
+ * XXX: for now since there are no easy way of specifying the maximum number
+ * of GPIO set dynamically, hardcode that to 32 (but it might be more).
+ */
+#define ARM_GICV3_MAX_WAKE_REQUEST 32
+
 static inline void gic_bmp_set_bit(int nr, uint32_t *addr)
 {
     uint32_t mask = GIC_BIT_MASK(nr);
@@ -155,6 +161,7 @@ struct GICv3CPUState {
     qemu_irq parent_fiq;
     qemu_irq parent_virq;
     qemu_irq parent_vfiq;
+    qemu_irq wake_request;
 
     /* Redistributor */
     uint32_t level;                  /* Current IRQ level */
@@ -329,5 +336,15 @@ struct ARMGICv3CommonClass {
 
 void gicv3_init_irqs_and_mmio(GICv3State *s, qemu_irq_handler handler,
                               const MemoryRegionOps *ops);
+
+/**
+ * gicv3_class_name
+ *
+ * Return name of GICv3 class to use depending on whether KVM acceleration is
+ * in use. May throw an error if the chosen implementation is not available.
+ *
+ * Returns: class name to use
+ */
+const char *gicv3_class_name(void);
 
 #endif

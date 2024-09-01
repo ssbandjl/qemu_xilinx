@@ -25,12 +25,13 @@
 #include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "hw/register.h"
+#include "hw/zynqmp_aes_key.h"
 #include "hw/nvram/xlnx-efuse.h"
 
 #define XLNX_VERSAL_EFUSE_CTRL_R_MAX ((0x100 / 4) + 1)
 
-#define TYPE_XLNX_VERSAL_EFUSE_CTRL  "xlnx-versal-efuse"
-#define TYPE_XLNX_VERSAL_EFUSE_CACHE "xlnx-pmc-efuse-cache"
+#define TYPE_XLNX_VERSAL_EFUSE_CTRL  "xlnx.versal-efuse"
+#define TYPE_XLNX_VERSAL_EFUSE_CACHE "xlnx.pmc-efuse-cache"
 
 OBJECT_DECLARE_SIMPLE_TYPE(XlnxVersalEFuseCtrl, XLNX_VERSAL_EFUSE_CTRL);
 OBJECT_DECLARE_SIMPLE_TYPE(XlnxVersalEFuseCache, XLNX_VERSAL_EFUSE_CACHE);
@@ -40,6 +41,9 @@ struct XlnxVersalEFuseCtrl {
     qemu_irq irq_efuse_imr;
 
     XlnxEFuse *efuse;
+    ZynqMPAESKeySink *aes_key_sink;
+    ZynqMPAESKeySink *usr_key0_sink;
+    ZynqMPAESKeySink *usr_key1_sink;
 
     void *extra_pg0_lock_spec;      /* Opaque property */
     uint32_t extra_pg0_lock_n16;
@@ -54,15 +58,5 @@ struct XlnxVersalEFuseCache {
 
     XlnxEFuse *efuse;
 };
-
-/**
- * xlnx_versal_efuse_read_row:
- * @s: the efuse object
- * @bit: the bit-address within the 32-bit row to be read
- * @denied: if non-NULL, to receive true if the row is write-only
- *
- * Returns: the 32-bit word containing address @bit; 0 if @denies is true
- */
-uint32_t xlnx_versal_efuse_read_row(XlnxEFuse *s, uint32_t bit, bool *denied);
 
 #endif

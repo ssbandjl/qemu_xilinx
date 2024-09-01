@@ -24,6 +24,7 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "sysemu/block-backend.h"
+#include "hw/block/block.h"
 #include "hw/qdev-properties.h"
 #include "hw/qdev-properties-system.h"
 #include "hw/ssi/ssi.h"
@@ -150,6 +151,8 @@ typedef struct FlashPartInfo {
 #define EVCFG_QUAD_IO_DISABLED (1 << 7)
 #define NVCFG_4BYTE_ADDR_MASK (1 << 0)
 #define NVCFG_LOWER_SEGMENT_MASK (1 << 1)
+#define VCFG_IO_MODE_OCTAL_DDR_DQS 0xE7
+#define VCFG_IO_MODE_OCTAL_DDR 0xC7
 
 /* Numonyx (Micron) Flag Status Register macros */
 #define FSR_4BYTE_ADDR_MODE_ENABLED 0x1
@@ -221,7 +224,8 @@ static const FlashPartInfo known_devices[] = {
     { INFO("is25wp032",   0x9d7016,      0,  64 << 10,  64, ER_4K) },
     { INFO("is25wp064",   0x9d7017,      0,  64 << 10, 128, ER_4K) },
     { INFO("is25wp128",   0x9d7018,      0,  64 << 10, 256, ER_4K) },
-    { INFO("is25wp256",   0x9d7019,      0,  64 << 10, 512, ER_4K) },
+    { INFO("is25wp256",   0x9d7019,      0,  64 << 10, 512, ER_4K),
+      .sfdp_read = m25p80_sfdp_is25wp256 },
 
     /* Macronix */
     { INFO("mx25l2005a",  0xc22012,      0,  64 << 10,   4, ER_4K) },
@@ -257,7 +261,8 @@ static const FlashPartInfo known_devices[] = {
     { INFO("n25q512a11",  0x20bb20,      0,  64 << 10, 1024, ER_4K) },
     { INFO("n25q512a13",  0x20ba20,      0,  64 << 10, 1024, ER_4K) },
     { INFO("m25qu02gcbb", 0x20bb22,      0,  64 << 10, 4096, ER_4K) },
-    { INFO("mt35xu01gbba", 0x2c5b1b, 0x104100, 128 << 10, 1024, ER_4K) },
+    { INFO("mt35xu01gbba", 0x2c5b1b, 0x104100, 128 << 10, 1024, ER_4K),
+      .sfdp_read = m25p80_sfdp_mt35xu01g },
     { INFO("mt35xu02gbba", 0x2c5b1c,     0, 128 << 10, 2048, ER_4K),
       .sfdp_read = m25p80_sfdp_mt35xu02g },
     { INFO("n25q128",     0x20ba18,      0,  64 << 10, 256, 0) },
@@ -744,6 +749,11 @@ static inline int get_addr_length(Flash *s)
    case DIOR4:
        return 4;
    default:
+       if (get_man(s) == MAN_MICRON_OCTAL &&
+          ((s->volatile_cfg_large[0] == VCFG_IO_MODE_OCTAL_DDR_DQS) ||
+          (s->volatile_cfg_large[0] == VCFG_IO_MODE_OCTAL_DDR))) {
+            return 4;
+       }
        return s->four_bytes_address_mode ? 4 : 3;
    }
 }
@@ -1787,6 +1797,7 @@ static void m25p80_realize(SSIPeripheral *ss, Error **errp)
         trace_m25p80_binding(s);
         s->storage = blk_blockalign(s->blk, s->size);
 
+        /* Xilinx */
         if (blk_pread(s->blk, 0, s->size, s->storage, 0) < 0) {
             error_setg(errp, "failed to read the initial flash content");
             return;

@@ -196,6 +196,20 @@ static void gicv3_redist_update_noirqset(GICv3CPUState *cs)
     }
 }
 
+static void gicv3_update_cpuif_or_emit_wake_request(GICv3CPUState *cs)
+{
+    if (cs->gicr_waker) {
+        /*
+         * The CPU interface is in quiescent state, that emits a WakeRequest
+         * when there is a pending IRQ.
+         */
+        qemu_set_irq(cs->wake_request, cs->hppi.prio != 0xff);
+    } else {
+        qemu_set_irq(cs->wake_request, 0);
+        gicv3_cpuif_update(cs);
+    }
+}
+
 /* Update the GIC status after state in a redistributor or
  * CPU interface has changed, and inform the CPU i/f of
  * its new highest priority pending interrupt.
@@ -203,7 +217,7 @@ static void gicv3_redist_update_noirqset(GICv3CPUState *cs)
 void gicv3_redist_update(GICv3CPUState *cs)
 {
     gicv3_redist_update_noirqset(cs);
-    gicv3_cpuif_update(cs);
+    gicv3_update_cpuif_or_emit_wake_request(cs);
 }
 
 /* Update the GIC status after state in the distributor has
@@ -282,7 +296,7 @@ void gicv3_update(GICv3State *s, int start, int len)
 
     gicv3_update_noirqset(s, start, len);
     for (i = 0; i < s->num_cpu; i++) {
-        gicv3_cpuif_update(&s->cpu[i]);
+        gicv3_update_cpuif_or_emit_wake_request(&s->cpu[i]);
     }
 }
 
@@ -318,7 +332,7 @@ void gicv3_full_update(GICv3State *s)
 
     gicv3_full_update_noirqset(s);
     for (i = 0; i < s->num_cpu; i++) {
-        gicv3_cpuif_update(&s->cpu[i]);
+        gicv3_update_cpuif_or_emit_wake_request(&s->cpu[i]);
     }
 }
 
@@ -427,6 +441,17 @@ static const FDTGenericGPIOSet arm_gicv3_client_gpios[] = {
     { },
 };
 
+static const FDTGenericGPIOSet arm_gicv3_controller_gpios[] = {
+    {
+        .names = &fdt_generic_gpio_name_set_gpio,
+        .gpios = (FDTGenericGPIOConnection[]) {
+            { .name = "wake-request", .range = ARM_GICV3_MAX_WAKE_REQUEST },
+            { },
+        },
+    },
+    { },
+};
+
 static void arm_gicv3_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -436,6 +461,7 @@ static void arm_gicv3_class_init(ObjectClass *klass, void *data)
 
     agcc->post_load = arm_gicv3_post_load;
     fggc->client_gpios = arm_gicv3_client_gpios;
+    fggc->controller_gpios = arm_gicv3_controller_gpios;
     device_class_set_parent_realize(dc, arm_gic_realize, &agc->parent_realize);
 }
 

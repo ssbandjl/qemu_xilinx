@@ -1,5 +1,10 @@
 git submodule update --init
 
+git remote add upstream https://github.com/Xilinx/qemu.git
+git remote -v
+git fetch upstream
+git merge upstream/master
+
 xilinx
 hw/timer/xilinx_timer.c
 timer_hit
@@ -98,6 +103,21 @@ rp_io_access
         trace_remote_port_memory_master_rx_busaccess
         rp_resp_slot_done
         rp_process -> 远程端口：内存主控：事务后排空处理队列，事务后排空处理队列。 对于强排序或不允许提前确认的交易，我们需要排空待处理的 RP 处理队列。 这是因为 RP 与正常请求并行处理响应，因此它们可能会被重新排序。 例如，在读取清除中断的读取清除寄存器时，此问题变得明显。 即使中断线的降低在读响应之前到达我们，我们也可以在线更新之前处理响应，从而导致虚假中断。 这有一些优化的空间，但现在我们使用大锤子并排空整个队列
+            while (true)
+                dev = s->devs[pkt->hdr.dev]
+                switch (pkt->hdr.cmd)
+                case RP_CMD_sync
+                    rp_cmd_sync(s, pkt)
+                        clk = rp_normalized_vmclk(s)
+                        enclen = rp_encode_sync_resp
+                            rp_encode_hdr(&pkt->hdr, RP_CMD_sync,
+                        ptimer_transaction_begin(s->sync.ptimer_resp)
+                        ptimer_run(s->sync.ptimer_resp, 1)
+                        ptimer_transaction_commit(s->sync.ptimer_resp)
+                            ptimer_reload(s, 0)
+                                ptimer_trigger(s)
+                                    s->callback(s->callback_opaque)
+                                timer_mod(s->timer, s->next_event)
         rp_restart_sync_timer
             ptimer_transaction_begin
             rp_restart_sync_timer_bare
@@ -698,3 +718,55 @@ Breakpoint 2, virtio_net_pci_instance_init (obj=0x5555575b8740) at hw/virtio/vir
 #7  0x00005555557d85d6 in main (argc=<optimized out>, argv=<optimized out>, envp=<optimized out>) at vl.c:4593
 
 
+
+remote_ref: https://git.ece.iastate.edu/sddec21-02/remote-port-demo
+
+hw/pci-host/remote.c
+type_init(remote_pcihost_register) -> type_register_static(&remote_pcihost_info)
+static const TypeInfo remote_pcihost_info = {
+    .name = TYPE_REMOTE_PCIHOST, -> remote-pcihost
+    .parent = TYPE_PCIE_HOST_BRIDGE, -> pcie-host-bridge
+    .instance_size = sizeof(RemotePCIHost),
+    .class_init = remote_pcihost_class_init,
+
+};
+
+
+
+rp_class_init
+    rp_realize
+        s->sync.ptimer = ptimer_init(sync_timer_hit, s, PTIMER_POLICY_LEGACY)
+            rp_say_sync
+                rp_encode_sync
+
+
+static const TypeInfo rp_info = {
+    .name          = TYPE_REMOTE_PORT, -> remote-port
+    .parent        = TYPE_DEVICE,
+    .instance_size = sizeof(RemotePort),
+    .instance_init = rp_init, <- object_init_with_type
+        RemotePort *s = REMOTE_PORT(obj)
+        for (i = 0; i < REMOTE_PORT_MAX_DEVS; ++i) -> 1024
+            char *name = g_strdup_printf("remote-port-dev%d", i)
+            for (t = 0; t < RP_MAX_OUTSTANDING_TRANSACTIONS; t++) -> 32
+                rp_dpkt_alloc(&s->dev_state[i].rsp_queue[t].rsp, sizeof s->dev_state[i].rsp_queue[t].rsp.pkt->busaccess + 1024)
+                    dpkt->pkt = realloc(dpkt->pkt, size)
+                    memset(u8 + dpkt->size, 0, size - dpkt->size)
+    .class_init    = rp_class_init,
+        dc->reset = rp_reset;
+        dc->realize = rp_realize;
+        dc->unrealize = rp_unrealize;
+        dc->vmsd = &vmstate_rp;
+};
+
+
+
+
+static void rp_realize(DeviceState *dev, Error **errp)
+    s->peer.clk_base = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
+    qemu_set_fd_handler(s->event.pipe.read, rp_event_read, NULL, s)
+
+
+rp_event_read
+    r = read(s->event.pipe.read, buf, sizeof buf)
+    rp_process(s)
